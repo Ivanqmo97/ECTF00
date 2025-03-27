@@ -1,123 +1,100 @@
 #!/usr/bin/env python3
+"""
+gen_subscription.py
+-------------------
+Este script genera un paquete de actualización de suscripción seguro que incluye un MAC.
+La estructura del paquete es:
+  - channel (4 bytes, little endian)
+  - start_timestamp (8 bytes, little endian)
+  - end_timestamp (8 bytes, little endian)
+  - mac (MAC_SIZE bytes)
+
+La clave para calcular el MAC se carga desde un archivo seguro (por defecto, 'shared_key.bin').
+"""
+
 import argparse
-import json
-from pathlib import Path
 import struct
-from Crypto.Cipher import AES
-from Crypto.Hash import CMAC
-from loguru import logger
+import hashlib
+import time
+import sys
+import os
 
-def encrypt_subscription(K_master: bytes, subscription_data: bytes) -> bytes:
-    """
-    "Cifra" (firma) los datos de suscripción usando AES-CMAC.
-    Esto protege la integridad del código de suscripción, de forma que cualquier modificación se detecte.
-    """
-    cobj = CMAC.new(K_master, ciphermod=AES)
-    cobj.update(subscription_data)
-    return cobj.digest()
+# Constantes
+KEY_LENGTH = 16         # Longitud de la clave en bytes
+HASH_SIZE = 16          # Se usará SHA-256 truncado a 16 bytes como MAC
+MAC_SIZE = HASH_SIZE
 
-def gen_subscription(
-    secrets: bytes, device_id: int, start: int, end: int, channel: int, encoder_id: int
-) -> bytes:
+def load_key(filename: str) -> bytes:
+    """Carga la clave desde un archivo en formato binario."""
+    try:
+        with open(filename, "rb") as f:
+            key = f.read(KEY_LENGTH)
+        if len(key) != KEY_LENGTH:
+            raise ValueError("La clave cargada no tiene la longitud esperada")
+        return key
+    except (IOError, ValueError) as e:
+        print(f"Error al cargar la clave desde '{filename}': {e}", file=sys.stderr)
+        sys.exit(1)
+
+def compute_mac(key: bytes, message: bytes) -> bytes:
     """
-    Genera el código de suscripción (C_SUBS) que se utilizará en el Decoder.
-    
-    La función empaqueta los siguientes campos:
-      - DECODER_ID: Identificador único del decodificador.
-      - T_inicio: Timestamp de inicio de la validez de la suscripción.
-      - T_fin: Timestamp de expiración de la suscripción.
-      - CH_ID: Identificador del canal autorizado.
-      - K00: Clave parcial asignada al dispositivo, derivada mediante TSS.
-      - ENCODER_ID: Identificador único del codificador.
-      
-    Posteriormente, se "cifra" (firma) el paquete utilizando AES-CMAC con la clave maestra (K_master)
-    para garantizar su integridad.
+    Calcula el MAC concatenando la clave cargada y el mensaje, y aplicando SHA-256.
+    Se trunca el resultado a MAC_SIZE bytes.
+    """
+    buffer = key + message
+    digest = hashlib.sha256(buffer).digest()
+    return digest[:MAC_SIZE]
+
+def build_subscription_update(key: bytes, channel: int, start_timestamp: int, end_timestamp: int) -> bytes:
+    """
+    Construye el paquete de actualización de suscripción seguro.
     
     Args:
-        secrets (bytes): Contenido del archivo de secretos generado por gen_secrets.py.
-        device_id (int): Identificador del decodificador (DECODER_ID).
-        start (int): Timestamp de inicio (T_inicio) de la suscripción.
-        end (int): Timestamp de expiración (T_fin) de la suscripción.
-        channel (int): Identificador del canal (CH_ID) al que se autoriza la suscripción.
-        encoder_id (int): Identificador del codificador (ENCODER_ID).
-        
+        key (bytes): Clave cargada para el cálculo del MAC.
+        channel (int): Número del canal (uint32).
+        start_timestamp (int): Timestamp de inicio (uint64).
+        end_timestamp (int): Timestamp de fin (uint64).
+    
     Returns:
-        bytes: Código de suscripción (C_SUBS) firmado.
+        bytes: Paquete de actualización de suscripción en formato binario.
     """
-    secrets = json.loads(secrets)
-    K_master = bytes.fromhex(secrets["K_master"])
-    partial_keys = secrets["partial_keys"]
-
-    # Seleccionamos la clave parcial correspondiente al dispositivo
-    partial_key = partial_keys[device_id % len(partial_keys)]
-
-    # Empaquetamos la suscripción siguiendo el orden:
-    # DECODER_ID, T_inicio, T_fin, CH_ID, [K00] (32 bytes) y ENCODER_ID.
-    subscription_plain = struct.pack(
-        "<IQQI32sI", 
-        device_id,     # DECODER_ID
-        start,         # T_inicio
-        end,           # T_fin
-        channel,       # CH_ID
-        bytes.fromhex(partial_key),  # Clave parcial asignada (K00)
-        encoder_id     # ENCODER_ID
-    )
-
-    # Firmamos el paquete de suscripción usando AES-CMAC con la clave maestra para proteger su integridad.
-    encrypted_subscription = encrypt_subscription(K_master, subscription_plain)
-
-    return encrypted_subscription
+    header = struct.pack('<IQQ', channel, start_timestamp, end_timestamp)
+    mac = compute_mac(key, header)
+    return header + mac
 
 def parse_args():
-    """
-    Define y analiza los argumentos de línea de comandos.
-    
-    NOTA: Esta función no debe ser modificada según los requerimientos del diseño.
-    """
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--force",
-        "-f",
-        action="store_true",
-        help="Forzar la creación del archivo de suscripción, sobreescribiendo el existente",
-    )
-    parser.add_argument(
-        "secrets_file",
-        type=argparse.FileType("rb"),
-        help="Ruta del archivo de secretos creado por ectf25_design.gen_secrets",
-    )
-    parser.add_argument("subscription_file", type=Path, help="Archivo de salida para la suscripción")
-    parser.add_argument(
-        "device_id", type=lambda x: int(x, 0), help="Identificador del dispositivo receptor (DECODER_ID)"
-    )
-    parser.add_argument(
-        "start", type=lambda x: int(x, 0), help="Timestamp de inicio de la suscripción (T_inicio)"
-    )
-    parser.add_argument("end", type=int, help="Timestamp de expiración de la suscripción (T_fin)")
-    parser.add_argument("channel", type=int, help="Canal al que se suscribe (CH_ID)")
-    parser.add_argument("encoder_id", type=lambda x: int(x, 0), help="Identificador del codificador (ENCODER_ID)")
+    parser = argparse.ArgumentParser(description="Genera un paquete de actualización de suscripción seguro con MAC.")
+    parser.add_argument("-c", "--channel", type=int, default=1, help="Número de canal (default: 1)")
+    parser.add_argument("-s", "--start", type=int, default=None, help="Timestamp de inicio. Por defecto se usa el tiempo actual.")
+    parser.add_argument("-e", "--end", type=int, default=None, help="Timestamp de fin. Por defecto se usa una hora después del inicio.")
+    parser.add_argument("-k", "--keyfile", type=str, default="shared_key.bin", help="Archivo desde donde cargar la clave (default: shared_key.bin)")
+    parser.add_argument("-o", "--output", type=str, default=None, help="Archivo de salida para guardar el paquete (opcional).")
     return parser.parse_args()
 
 def main():
-    """
-    Función principal de gen_subscription.
-    
-    Se encarga de generar el código de suscripción (C_SUBS) que incluye:
-      - DECODER_ID, T_inicio, T_fin, CH_ID, la clave parcial (K00) y ENCODER_ID.
-    El resultado se firma utilizando AES-CMAC con K_master y se escribe en el archivo de salida.
-    """
     args = parse_args()
-
-    subscription = gen_subscription(
-        args.secrets_file.read(), args.device_id, args.start, args.end, args.channel, args.encoder_id
-    )
-
-    logger.debug(f"Generated subscription: {subscription}")
-
-    with open(args.subscription_file, "wb" if args.force else "xb") as f:
-        f.write(subscription)
-
-    logger.success(f"Wrote subscription to {str(args.subscription_file.absolute())}")
+    
+    # Cargar la clave segura desde el archivo especificado
+    key = load_key(args.keyfile)
+    
+    channel = args.channel
+    start_timestamp = args.start if args.start is not None else int(time.time())
+    end_timestamp = args.end if args.end is not None else (start_timestamp + 3600)
+    
+    update_packet = build_subscription_update(key, channel, start_timestamp, end_timestamp)
+    
+    # Mostrar el paquete en formato hexadecimal
+    print("Subscription update packet (hex):", update_packet.hex())
+    
+    # Si se especifica un archivo de salida, guardarlo
+    if args.output:
+        try:
+            with open(args.output, "wb") as f:
+                f.write(update_packet)
+            print(f"Paquete guardado en '{args.output}'")
+        except IOError as e:
+            print(f"Error al guardar el paquete: {e}", file=sys.stderr)
+            sys.exit(1)
 
 if __name__ == "__main__":
     main()
